@@ -1,0 +1,52 @@
+services:
+  exo-watchdog:
+    build: .
+    container_name: exo-watchdog
+    restart: unless-stopped
+    ports:
+      - "8765:8000"
+    environment:
+      EXO_ENDPOINTS: "http://192.168.20.1:52415,http://192.168.20.2:52415,http://192.168.20.3:52415"
+      EXO_CONTROL_ENDPOINT: "http://192.168.20.1:52415"
+      EXO_DESIRED_MODEL: "mlx-community/Qwen3-30B-A3B-4bit"
+      EXO_SHARDING: "Pipeline"
+      EXO_INSTANCE_META: "MlxRing"
+      EXO_MIN_NODES: "3"
+      POLL_INTERVAL_SECONDS: "15"
+      RESTART_COOLDOWN_SECONDS: "120"
+      AUTO_RESTART: "false"
+      LOG_LEVEL: "INFO"
+      WATCHDOG_DB_PATH: "/data/watchdog.db"
+      WATCHDOG_MAX_PROMPT_CHARS: "9000"
+      WATCHDOG_MAX_GEO_CONTEXT_CHARS: "1200"
+      WATCHDOG_MAX_ARTICLE_CHARS: "900"
+      WATCHDOG_NEWS_MIN_CHARS: "900"
+      WATCHDOG_NEWS_MAX_TOKENS: "96"
+      WATCHDOG_HOURLY_MAX_ITEMS: "4"
+      WATCHDOG_HOURLY_REDUCE_MAX_CHARS: "5000"
+      WATCHDOG_HOURLY_REDUCE_BATCH_SIZE: "4"
+      WATCHDOG_HOURLY_SINGLE_PASS_MAX_ITEMS: "4"
+      WATCHDOG_HOURLY_SINGLE_PASS_MAX_CHARS: "1800"
+      WATCHDOG_JOB_STALL_SECONDS: "600"
+      WATCHDOG_ACTIVE_JOB_RECOVERY_GRACE_SECONDS: "90"
+      WATCHDOG_REMOTE_RESTART_GRACE_SECONDS: "90"
+      WATCHDOG_NODE_STALE_SECONDS: "45"
+      WATCHDOG_HOURLY_PREFLIGHT_TIMEOUT_SECONDS: "600"
+      WATCHDOG_CLUSTER_FORM_TIMEOUT_SECONDS: "600"
+      WATCHDOG_DAILY_RESTART_ENABLED: "true"
+      WATCHDOG_DAILY_RESTART_HOUR: "4"
+      WATCHDOG_DAILY_RESTART_MINUTE: "15"
+      WATCHDOG_DAILY_RESTART_TZ: "America/Los_Angeles"
+      WATCHDOG_DAILY_RESTART_CHECK_SECONDS: "30"
+      WATCHDOG_SSH_CONFIG: "/run/watchdog-ssh-user/config"
+      WATCHDOG_SSH_KNOWN_HOSTS: "/run/watchdog-ssh-user/known_hosts"
+      WATCHDOG_SSH_IDENTITY_FILE: "/run/watchdog-secrets/id_exo"
+      WATCHDOG_REMOTE_HOSTS_JSON: >-
+        [{"name":"exo-126","ssh_target":"magi1@10.0.0.126","health_host":"192.168.20.3","restart_cmd":"pkill -f exo_daemon 2>/dev/null; pkill -f '/exo/.venv/bin/exo' 2>/dev/null; sleep 2; nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & disown"},{"name":"exo-127","ssh_target":"wenjieliu@10.0.0.127","health_host":"192.168.20.1","restart_cmd":"pkill -f exo_daemon 2>/dev/null; pkill -f '/exo/.venv/bin/exo' 2>/dev/null; sleep 2; nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & disown"},{"name":"exo-128","ssh_target":"magi2@10.0.0.128","health_host":"192.168.20.2","restart_cmd":"pkill -f exo_daemon 2>/dev/null; pkill -f '/exo/.venv/bin/exo' 2>/dev/null; sleep 2; nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & disown"}]
+    volumes:
+      - ./data:/data
+      - ./ssh-user:/run/watchdog-ssh-user
+      - /home/taiwei/.ssh/id_mini_wenjie:/run/watchdog-secrets/id_exo:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    network_mode: host

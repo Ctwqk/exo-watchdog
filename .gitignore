@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+data/*
+ssh/*
+ssh-user/*
+!data/.gitkeep
+!ssh/.gitkeep
+!ssh-user/.gitkeep
