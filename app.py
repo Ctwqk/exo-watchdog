@@ -154,27 +154,27 @@ DEFAULT_REMOTE_HOSTS_JSON = json.dumps(
             "name": "exo-126",
             "ssh_target": "magi1@10.0.0.126",
             "health_host": "192.168.20.1",
-            "restart_cmd": "kill $(pgrep -f exo_daemon) 2>/dev/null; "
-            "kill $(pgrep -f \"uv run exo\") 2>/dev/null; "
-            "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
+            "restart_cmd": "pkill -f exo_daemon 2>/dev/null; "
+            "pkill -f '/exo/.venv/bin/exo' 2>/dev/null; "
+            "sleep 2; nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
             "disown",
         },
         {
             "name": "exo-127",
             "ssh_target": "wenjieliu@10.0.0.127",
             "health_host": "192.168.20.2",
-            "restart_cmd": "kill $(pgrep -f exo_daemon) 2>/dev/null; "
-            "kill $(pgrep -f \"uv run exo\") 2>/dev/null; "
-            "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
+            "restart_cmd": "pkill -f exo_daemon 2>/dev/null; "
+            "pkill -f '/exo/.venv/bin/exo' 2>/dev/null; "
+            "sleep 2; nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
             "disown",
         },
         {
             "name": "exo-128",
             "ssh_target": "magi2@10.0.0.128",
             "health_host": "192.168.20.3",
-            "restart_cmd": "kill $(pgrep -f exo_daemon) 2>/dev/null; "
-            "kill $(pgrep -f \"uv run exo\") 2>/dev/null; "
-            "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
+            "restart_cmd": "pkill -f exo_daemon 2>/dev/null; "
+            "pkill -f '/exo/.venv/bin/exo' 2>/dev/null; "
+            "sleep 2; nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
             "disown",
         },
     ]
@@ -276,6 +276,8 @@ class WatchdogState:
     instance_to_host_map: dict[str, list[str]] = field(default_factory=dict)
     host_health: dict[str, dict[str, Any]] = field(default_factory=dict)
     peer_health: dict[str, dict[str, Any]] = field(default_factory=dict)
+    runners: dict[str, str] = field(default_factory=dict)
+    instances: dict[str, str] = field(default_factory=dict)
     backend: str = "exo"
     desired_model: str = EXO_DESIRED_MODEL
     model: str | None = None
@@ -541,15 +543,9 @@ def _build_openai_response(
 
 
 def _content_from_openai_response(payload: dict[str, Any]) -> str:
-    return _strip_think(
-        str(
-            (
-                payload.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-        )
-    )
+    choices = payload.get("choices") or [{}]
+    message = choices[0].get("message") or {} if choices else {}
+    return str(message.get("content") or "").strip()
 
 
 def _parse_remote_hosts() -> list[RemoteHost]:
@@ -2218,7 +2214,13 @@ def _prepare_ssh_runtime() -> None:
     if WATCHDOG_SSH_KNOWN_HOSTS.exists() and WATCHDOG_SSH_KNOWN_HOSTS.stat().st_size > 0:
         return
 
-    ips = sorted({host.ip for host in REMOTE_HOSTS})
+    # Scan both health_host IPs and ssh_target IPs for known_hosts
+    ssh_ips = set()
+    for host in REMOTE_HOSTS:
+        ssh_ips.add(host.ip)
+        target_ip = host.ssh_target.split("@", 1)[-1].split(":", 1)[0]
+        ssh_ips.add(target_ip)
+    ips = sorted(ssh_ips)
     if not ips:
         return
 
@@ -2666,6 +2668,7 @@ def _extract_state_instances(state_payload: dict[str, Any]) -> list[dict[str, An
                 "model": model_id,
                 "node_ids": node_ids,
                 "hosts": list(dict.fromkeys(hosts)),
+                "node_to_runner": {str(k): str(v) for k, v in node_to_runner.items()},
             }
         )
     return parsed
@@ -2730,7 +2733,7 @@ async def _call_exo_chat(
                 )
                 response.raise_for_status()
                 data = response.json()
-                content = _content_from_openai_response(data)
+                content = _strip_think(_content_from_openai_response(data))
                 if not content and int(payload.get("max_tokens") or 0) > 0:
                     raise RuntimeError("exo returned empty response")
                 _state.api_endpoint = base_url
@@ -3224,7 +3227,7 @@ async def _probe_exo() -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("Probe completion failed: %s", exc)
         return False
-    return _content_from_openai_response(payload).upper().startswith("OK")
+    return _strip_think(_content_from_openai_response(payload)).upper().startswith("OK")
 
 
 async def _poll_once(trigger_recovery: bool = False) -> None:
@@ -3305,6 +3308,25 @@ async def _poll_once(trigger_recovery: bool = False) -> None:
                         if host_ip not in instance_to_host_map[model_id]:
                             instance_to_host_map[model_id].append(host_ip)
 
+            # Build runners dict {runner_id: status} and instances dict {instance_id: model_id}
+            runners: dict[str, str] = {}
+            instances: dict[str, str] = {}
+            for instance in active_instances:
+                iid = str(instance.get("instance_id") or "")
+                model_id = str(instance.get("model") or "")
+                if iid:
+                    instances[iid] = model_id
+                for _node_id, runner_val in (instance.get("node_to_runner") or {}).items():
+                    runner_str = str(runner_val)
+                    # runner_val may be a status string like "RunnerRunning" or a dict
+                    if isinstance(runner_val, dict):
+                        rid = str(runner_val.get("id") or runner_val.get("runner_id") or _node_id)
+                        status = str(runner_val.get("status") or "Unknown")
+                    else:
+                        rid = _node_id
+                        status = runner_str if runner_str else "Unknown"
+                    runners[rid] = status
+
             node_identities = selected_payload.get("nodeIdentities") or selected_payload.get("node_identities") or {}
             node_memory = selected_payload.get("nodeMemory") or selected_payload.get("node_memory") or {}
             last_seen = selected_payload.get("lastSeen") or selected_payload.get("last_seen") or {}
@@ -3369,6 +3391,8 @@ async def _poll_once(trigger_recovery: bool = False) -> None:
         _state.instance_to_host_map = instance_to_host_map
         _state.instance_status = instance_status
         _state.host_health = host_health
+        _state.runners = runners
+        _state.instances = instances
         _state.peer_health = {
             host: {key: value for key, value in probe.items() if key != "payload"}
             for host, probe in peer_health.items()
@@ -3419,6 +3443,89 @@ def _hosts_needing_restart() -> list[RemoteHost]:
         if not _state.host_health.get(host.ip, {}).get("healthy"):
             hosts.append(host)
     return hosts
+
+
+async def _run_remote_cmd(host: RemoteHost, cmd: str) -> dict[str, Any]:
+    """Execute an arbitrary command on a remote host via SSH."""
+    if not _ssh_enabled():
+        raise RuntimeError("SSH runtime is not configured")
+
+    ssh_command = [
+        "ssh",
+        "-tt",
+        "-F",
+        str(WATCHDOG_SSH_CONFIG),
+        host.ssh_target,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *ssh_command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    steps = [step.strip() for step in cmd.split(";") if step.strip()]
+    session_commands = steps + [
+        "echo __WATCHDOG_CMD_DONE__:$?",
+        "exit",
+    ]
+
+    async def _read_stream(stream: asyncio.StreamReader) -> str:
+        chunks: list[bytes] = []
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+    stdout_task = asyncio.create_task(_read_stream(proc.stdout))
+    stderr_task = asyncio.create_task(_read_stream(proc.stderr))
+
+    try:
+        if proc.stdin is None:
+            raise RuntimeError(f"SSH stdin is unavailable for {host.name}")
+        for command in session_commands:
+            proc.stdin.write(f"{command}\n".encode("utf-8"))
+            await proc.stdin.drain()
+            await asyncio.sleep(0.35)
+        proc.stdin.close()
+        await proc.stdin.wait_closed()
+    except Exception:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        stdout_task.cancel()
+        stderr_task.cancel()
+        raise
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=90)
+    except asyncio.TimeoutError as exc:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise RuntimeError(f"SSH command timed out for {host.name}") from exc
+
+    stdout = await stdout_task
+    stderr = await stderr_task
+
+    result = {
+        "host": host.name,
+        "ssh_target": host.ssh_target,
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"SSH command failed for {host.name}: {result['stderr'] or result['stdout'] or proc.returncode}"
+        )
+    return result
 
 
 async def _restart_remote_host(host: RemoteHost) -> dict[str, Any]:
@@ -4159,7 +4266,7 @@ async def _map_hourly_item(model: str, item: dict[str, str], route: dict[str, An
     }
     try:
         response = await _call_routed_chat(request, route)
-        content = _content_from_openai_response(response)
+        content = _strip_think(_content_from_openai_response(response))
         parsed = _extract_first_json(content)
         if parsed:
             parsed.setdefault("link", item["link"])
@@ -4227,7 +4334,7 @@ async def _reduce_hourly_blocks(
         "enable_thinking": False,
     }
     response = await _call_routed_chat(request, route)
-    content = _content_from_openai_response(response)
+    content = _strip_think(_content_from_openai_response(response))
     if not content:
         raise RuntimeError("local LLM returned empty hourly summary")
     return content
@@ -4271,7 +4378,7 @@ async def _run_hourly_single_pass(
         "enable_thinking": False,
     }
     response = await _call_routed_chat(request, route)
-    content = _content_from_openai_response(response)
+    content = _strip_think(_content_from_openai_response(response))
     if not content:
         raise RuntimeError("local LLM returned empty hourly summary")
 
@@ -4537,6 +4644,8 @@ async def status():
         "instance_to_host_map": _state.instance_to_host_map,
         "instance_status": _state.instance_status,
         "host_health": _state.host_health,
+        "runners": _state.runners,
+        "instances": _state.instances,
     }
 
 
@@ -4576,6 +4685,85 @@ async def restart(host_name: str | None = None):
     _host_state_update(host.name, ts=_state.last_restart_ts, result=result, error=None)
     asyncio.create_task(_poll_once(trigger_recovery=False))
     return {"restarted": True, "detail": result, "host": host.name}
+
+
+@app.post("/host/stop")
+async def host_stop(host_name: str):
+    """Stop exo processes on a remote host via SSH."""
+    host = next(
+        (item for item in REMOTE_HOSTS if item.name == host_name or item.ip == host_name),
+        None,
+    )
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host {host_name} not found")
+    # Extract only the kill/pkill steps from restart_cmd (skip nohup/start/sleep steps)
+    stop_parts = [
+        step.strip()
+        for step in host.restart_cmd.split(";")
+        if step.strip() and any(k in step for k in ("kill", "pkill"))
+    ]
+    stop_cmd = "; ".join(stop_parts) + "; true" if stop_parts else "pkill -f '/exo/.venv/bin/exo' 2>/dev/null; true"
+    # Use direct SSH command (not interactive -tt stdin) for reliability
+    ssh_args = [
+        "ssh", "-T",
+        "-F", str(WATCHDOG_SSH_CONFIG),
+        "-o", "ConnectTimeout=10",
+        host.ssh_target,
+        stop_cmd,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        result = {
+            "host": host.name,
+            "returncode": proc.returncode,
+            "stdout": stdout.decode(errors="replace").strip(),
+            "stderr": stderr.decode(errors="replace").strip(),
+        }
+    except Exception as e:
+        result = {"note": "stop command failed", "detail": str(e)}
+    asyncio.create_task(_poll_once(trigger_recovery=False))
+    return {"stopped": True, "detail": result, "host": host.name}
+
+
+@app.post("/host/start")
+async def host_start(host_name: str):
+    """Start exo daemon on a remote host via SSH."""
+    host = next(
+        (item for item in REMOTE_HOSTS if item.name == host_name or item.ip == host_name),
+        None,
+    )
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host {host_name} not found")
+    start_cmd = "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & sleep 2; echo started"
+    ssh_args = [
+        "ssh", "-T",
+        "-F", str(WATCHDOG_SSH_CONFIG),
+        "-o", "ConnectTimeout=10",
+        host.ssh_target,
+        start_cmd,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        result = {
+            "host": host.name,
+            "returncode": proc.returncode,
+            "stdout": stdout.decode(errors="replace").strip(),
+            "stderr": stderr.decode(errors="replace").strip(),
+        }
+    except Exception as e:
+        result = {"note": "start command failed", "detail": str(e)}
+    asyncio.create_task(_poll_once(trigger_recovery=False))
+    return {"started": True, "detail": result, "host": host.name}
 
 
 @app.post("/poll")
