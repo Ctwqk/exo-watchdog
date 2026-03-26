@@ -1187,6 +1187,20 @@ def _default_llm_routes() -> list[dict[str, Any]]:
             "notes": "Job Autoflow resume and cover-letter tailoring route.",
         },
         {
+            "id": "videoprocess-generic-chat",
+            "source_pattern": "videoprocess",
+            "profile_pattern": "generic_chat",
+            "backend": "openai_compatible",
+            "provider": "minimax",
+            "provider_config_id": "minimax",
+            "model": "MiniMax-M2.7",
+            "base_url": "https://api.minimaxi.com/v1",
+            "api_key_env": "",
+            "enabled": True,
+            "priority": 215,
+            "notes": "VideoProcess translation and related generic chat route pinned to MiniMax M2.7.",
+        },
+        {
             "id": "x-bot-posts",
             "source_pattern": "x-bot",
             "profile_pattern": "generic_chat",
@@ -3260,6 +3274,8 @@ async def _poll_once(trigger_recovery: bool = False) -> None:
         resolved_model = _state.model or EXO_DESIRED_MODEL
         instance_to_host_map = dict(_state.instance_to_host_map)
         instance_status = _state.instance_status
+        runners: dict[str, str] = {}
+        instances: dict[str, str] = {}
 
         if selected_payload is None or selected_endpoint is None:
             anomalies.append("exo cluster unreachable")
@@ -4687,6 +4703,123 @@ async def restart(host_name: str | None = None):
     return {"restarted": True, "detail": result, "host": host.name}
 
 
+async def _ssh_exec(host: RemoteHost, cmd: str, timeout: int = 30) -> dict[str, Any]:
+    """Run a command on a remote host via SSH and return the result."""
+    ssh_args = [
+        "ssh", "-T",
+        "-F", str(WATCHDOG_SSH_CONFIG),
+        "-o", "ConnectTimeout=10",
+        host.ssh_target,
+        cmd,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *ssh_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return {
+        "host": host.name,
+        "returncode": proc.returncode,
+        "stdout": stdout.decode(errors="replace").strip(),
+        "stderr": stderr.decode(errors="replace").strip(),
+    }
+
+
+async def _delete_all_instances() -> list[str]:
+    """Delete all active instances from the exo cluster. Returns list of deleted IDs."""
+    deleted: list[str] = []
+    if not _state.instances:
+        return deleted
+    base_url = _state.api_endpoint
+    if not base_url:
+        return deleted
+    async with httpx.AsyncClient(timeout=WATCHDOG_HTTP_TIMEOUT_SECONDS) as client:
+        for instance_id in list(_state.instances.keys()):
+            try:
+                response = await client.delete(f"{base_url.rstrip('/')}/instance/{instance_id}")
+                response.raise_for_status()
+                deleted.append(instance_id)
+            except Exception as exc:
+                log.warning("Failed to delete instance %s: %s", instance_id, exc)
+    return deleted
+
+
+async def _wait_cluster_and_place(
+    expected_healthy: set[str] | None = None,
+    delay: float = 15.0,
+    retries: int = 20,
+    min_nodes: int = EXO_MIN_NODES,
+) -> None:
+    """Background task: wait for expected hosts to be healthy and cluster to form, then place.
+
+    *expected_healthy* is a set of host IPs that should become healthy.  If ``None``,
+    defaults to all hosts whose peer endpoint is currently reachable (i.e. we don't
+    wait for nodes that were already down before the start request).
+    """
+    if expected_healthy is None:
+        expected_healthy = {
+            h.ip for h in REMOTE_HOSTS
+            if _state.peer_health.get(h.ip, {}).get("healthy")
+        }
+    if not expected_healthy:
+        log.warning("_wait_cluster_and_place: no expected healthy hosts")
+        return
+
+    # Use min_nodes as the threshold: we need at least min_nodes healthy
+    # peers and topology nodes, not necessarily ALL expected hosts.
+    required = min_nodes
+
+    for attempt in range(retries):
+        await asyncio.sleep(delay)
+        await _poll_once(trigger_recovery=False)
+        healthy_count = sum(
+            1 for ip in expected_healthy
+            if _state.peer_health.get(ip, {}).get("healthy")
+        )
+        if healthy_count >= required:
+            base_url = _state.api_endpoint
+            if not base_url and _switch_to_healthy_endpoint():
+                base_url = _state.api_endpoint
+            if base_url:
+                try:
+                    async with httpx.AsyncClient(timeout=WATCHDOG_HTTP_TIMEOUT_SECONDS) as client:
+                        resp = await client.get(f"{base_url.rstrip('/')}/state")
+                        state = resp.json()
+                        topo_nodes = len(state.get("topology", {}).get("nodes", []))
+                        if topo_nodes < required:
+                            log.info(
+                                "Peers healthy but topology has %d/%d nodes (attempt %d), waiting...",
+                                topo_nodes, required, attempt + 1,
+                            )
+                            continue
+                        payload = {
+                            "model_id": EXO_DESIRED_MODEL,
+                            "sharding": EXO_SHARDING,
+                            "instance_meta": EXO_INSTANCE_META,
+                            "min_nodes": min_nodes,
+                        }
+                        resp = await client.post(
+                            f"{base_url.rstrip('/')}/place_instance", json=payload,
+                        )
+                        resp.raise_for_status()
+                    log.info(
+                        "Auto-placed model after host start (attempt %d, min_nodes=%d)",
+                        attempt + 1, min_nodes,
+                    )
+                    await asyncio.sleep(5)
+                    await _poll_once(trigger_recovery=False)
+                    return
+                except Exception as exc:
+                    log.warning("Auto-place after start failed (attempt %d): %s", attempt + 1, exc)
+        else:
+            log.info(
+                "Waiting for cluster: %d/%d peers healthy, need %d (attempt %d/%d)",
+                healthy_count, len(expected_healthy), required, attempt + 1, retries,
+            )
+    log.warning("Gave up waiting for healthy cluster to auto-place model")
+
+
 @app.post("/host/stop")
 async def host_stop(host_name: str):
     """Stop exo processes on a remote host via SSH."""
@@ -4696,74 +4829,235 @@ async def host_stop(host_name: str):
     )
     if host is None:
         raise HTTPException(status_code=404, detail=f"Host {host_name} not found")
-    # Extract only the kill/pkill steps from restart_cmd (skip nohup/start/sleep steps)
-    stop_parts = [
-        step.strip()
-        for step in host.restart_cmd.split(";")
-        if step.strip() and any(k in step for k in ("kill", "pkill"))
-    ]
-    stop_cmd = "; ".join(stop_parts) + "; true" if stop_parts else "pkill -f '/exo/.venv/bin/exo' 2>/dev/null; true"
-    # Use direct SSH command (not interactive -tt stdin) for reliability
-    ssh_args = [
-        "ssh", "-T",
-        "-F", str(WATCHDOG_SSH_CONFIG),
-        "-o", "ConnectTimeout=10",
-        host.ssh_target,
-        stop_cmd,
-    ]
+
+    # Step 1: Delete active instances so the cluster cleanly releases runners
+    deleted = await _delete_all_instances()
+
+    # Step 2: Kill exo processes on the target host.
+    # Use SIGKILL: exo can hang after shutdown (METAL GPU cleanup) ignoring SIGTERM.
+    # Kill both the daemon and the exo binary so nothing auto-restarts.
+    stop_cmd = (
+        "pkill -9 -f exo_daemon 2>/dev/null; "
+        "pkill -9 -f '/exo/.venv/bin/exo' 2>/dev/null; "
+        "true"
+    )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *ssh_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        result = {
-            "host": host.name,
-            "returncode": proc.returncode,
-            "stdout": stdout.decode(errors="replace").strip(),
-            "stderr": stderr.decode(errors="replace").strip(),
-        }
+        result = await _ssh_exec(host, stop_cmd)
     except Exception as e:
         result = {"note": "stop command failed", "detail": str(e)}
+    result["deleted_instances"] = deleted
     asyncio.create_task(_poll_once(trigger_recovery=False))
     return {"stopped": True, "detail": result, "host": host.name}
 
 
 @app.post("/host/start")
 async def host_start(host_name: str):
-    """Start exo daemon on a remote host via SSH."""
+    """Start exo daemon on a remote host via SSH.
+
+    After starting the target, also restarts other running peers so that all
+    nodes perform fresh P2P discovery and form a connected cluster.
+    """
     host = next(
         (item for item in REMOTE_HOSTS if item.name == host_name or item.ip == host_name),
         None,
     )
     if host is None:
         raise HTTPException(status_code=404, detail=f"Host {host_name} not found")
-    start_cmd = "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & sleep 2; echo started"
-    ssh_args = [
-        "ssh", "-T",
-        "-F", str(WATCHDOG_SSH_CONFIG),
-        "-o", "ConnectTimeout=10",
-        host.ssh_target,
-        start_cmd,
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *ssh_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+
+    # Step 1: Kill exo on other running peers so that when we start the
+    # target and peers come back up (via their daemon), they all perform
+    # fresh P2P discovery simultaneously and form a connected cluster.
+    # If we start the target first, it discovers the OLD peer processes,
+    # does an election with them, and when those peers restart the
+    # connection is stale.
+    restarted_peers: list[str] = []
+    for other in REMOTE_HOSTS:
+        if other.name == host.name:
+            continue
+        if not _state.peer_health.get(other.ip, {}).get("healthy"):
+            continue
+        # Kill the exo binary and any orphaned child processes, NOT the daemon.
+        # Use SIGKILL: exo can hang after METAL GPU shutdown.
+        kill_cmd = (
+            "pkill -9 -f '/exo/.venv/bin/exo' 2>/dev/null; "
+            "pkill -9 -f 'exo/.venv' 2>/dev/null; "
+            "true"
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        result = {
-            "host": host.name,
-            "returncode": proc.returncode,
-            "stdout": stdout.decode(errors="replace").strip(),
-            "stderr": stderr.decode(errors="replace").strip(),
-        }
+        try:
+            await _ssh_exec(other, kill_cmd)
+            restarted_peers.append(other.name)
+            log.info("Killed exo on peer %s for cluster formation (daemon will auto-restart)", other.name)
+        except Exception as exc:
+            log.warning("Failed to kill exo on peer %s: %s", other.name, exc)
+
+    # Step 2: Start the exo daemon on the target host.
+    # By now the peers' exo processes are dead and their daemons will
+    # restart them in ~10s, so all nodes come up around the same time.
+    start_cmd = "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & sleep 2; echo started"
+    try:
+        result = await _ssh_exec(host, start_cmd)
     except Exception as e:
         result = {"note": "start command failed", "detail": str(e)}
+
+    # Step 3: Determine which hosts should be healthy, then wait + auto-place
+    expected_ips = {host.ip}
+    for other in REMOTE_HOSTS:
+        if other.name in restarted_peers:
+            expected_ips.add(other.ip)
+    min_nodes = len(expected_ips)
+
+    asyncio.create_task(
+        _wait_cluster_and_place(
+            expected_healthy=expected_ips,
+            min_nodes=min_nodes,
+        )
+    )
     asyncio.create_task(_poll_once(trigger_recovery=False))
-    return {"started": True, "detail": result, "host": host.name}
+    return {
+        "started": True,
+        "detail": result,
+        "host": host.name,
+        "restarted_peers": restarted_peers,
+    }
+
+
+@app.post("/cluster/stop")
+async def cluster_stop():
+    """Stop all exo nodes across the cluster.
+
+    1. Delete all active instances
+    2. Kill daemon + exo + orphaned processes on every host (SIGKILL)
+    No restart — nodes stay down until /cluster/restart is called.
+    """
+    deleted = await _delete_all_instances()
+    log.info("cluster_stop: deleted %d instances", len(deleted))
+
+    kill_results: list[dict[str, Any]] = []
+    for host in REMOTE_HOSTS:
+        stop_cmd = (
+            "pkill -9 -f exo_daemon 2>/dev/null; "
+            "pkill -9 -f '/exo/.venv/bin/exo' 2>/dev/null; "
+            "pkill -9 -f 'exo/.venv' 2>/dev/null; "
+            "pkill -9 -f 'multiprocessing.spawn' 2>/dev/null; "
+            "pkill -9 -f 'multiprocessing.resource_tracker' 2>/dev/null; "
+            "true"
+        )
+        try:
+            await _ssh_exec(host, stop_cmd, timeout=30)
+            kill_results.append({"host": host.name, "ok": True})
+            log.info("cluster_stop: stopped %s", host.name)
+        except Exception as exc:
+            kill_results.append({"host": host.name, "ok": False, "error": str(exc)})
+            log.warning("cluster_stop: failed to stop %s: %s", host.name, exc)
+
+    asyncio.create_task(_poll_once(trigger_recovery=False))
+    return {
+        "stopped": True,
+        "deleted_instances": deleted,
+        "kill_results": kill_results,
+    }
+
+
+@app.post("/cluster/restart")
+async def cluster_restart(
+    min_nodes: int = EXO_MIN_NODES,
+):
+    """Restart all exo nodes and re-place the model.
+
+    This is the same procedure as the daily scheduled restart:
+    1. Delete all active instances
+    2. Kill all exo processes on all hosts (SIGKILL)
+    3. Wait for daemons to auto-restart exo on each host
+    4. Wait for cluster P2P discovery and topology formation
+    5. Place the desired model with the specified min_nodes
+    """
+    # Step 1: Delete instances
+    deleted = await _delete_all_instances()
+    log.info("cluster_restart: deleted %d instances", len(deleted))
+
+    # Step 2: Full restart on all hosts - kill everything (daemon, exo, orphaned
+    # multiprocessing workers) then restart the daemon.  This matches the daily
+    # restart flow which is known to be reliable.
+    kill_results: list[dict[str, Any]] = []
+    reachable_ips: set[str] = set()
+    for host in REMOTE_HOSTS:
+        restart_cmd = (
+            "pkill -9 -f exo_daemon 2>/dev/null; "
+            "pkill -9 -f '/exo/.venv/bin/exo' 2>/dev/null; "
+            "pkill -9 -f 'exo/.venv' 2>/dev/null; "
+            "pkill -9 -f 'multiprocessing.spawn' 2>/dev/null; "
+            "pkill -9 -f 'multiprocessing.resource_tracker' 2>/dev/null; "
+            "sleep 2; "
+            "nohup ~/exo/exo_daemon.sh > /dev/null 2>&1 & "
+            "sleep 2; echo restarted"
+        )
+        try:
+            await _ssh_exec(host, restart_cmd, timeout=30)
+            kill_results.append({"host": host.name, "ok": True})
+            reachable_ips.add(host.ip)
+            log.info("cluster_restart: restarted %s", host.name)
+        except Exception as exc:
+            kill_results.append({"host": host.name, "ok": False, "error": str(exc)})
+            log.warning("cluster_restart: failed to restart %s: %s", host.name, exc)
+
+    # Step 3: Background - wait for cluster formation and auto-place.
+    # Only expect hosts where the kill succeeded (reachable via SSH).
+    expected_ips = reachable_ips
+    asyncio.create_task(
+        _wait_cluster_and_place(
+            expected_healthy=expected_ips,
+            min_nodes=min_nodes,
+        )
+    )
+    asyncio.create_task(_poll_once(trigger_recovery=False))
+
+    return {
+        "restarting": True,
+        "deleted_instances": deleted,
+        "kill_results": kill_results,
+        "min_nodes": min_nodes,
+    }
+
+
+@app.post("/instance/place")
+async def instance_place(
+    model_id: str = EXO_DESIRED_MODEL,
+    min_nodes: int = EXO_MIN_NODES,
+    sharding: str = EXO_SHARDING,
+    instance_meta: str = EXO_INSTANCE_META,
+):
+    """Place a new model instance on the exo cluster."""
+    base_url = _state.api_endpoint
+    if not base_url:
+        if not _switch_to_healthy_endpoint():
+            raise HTTPException(status_code=503, detail="No healthy exo endpoint available")
+        base_url = _state.api_endpoint
+    payload = {
+        "model_id": model_id,
+        "sharding": sharding,
+        "instance_meta": instance_meta,
+        "min_nodes": min_nodes,
+    }
+    async with httpx.AsyncClient(timeout=WATCHDOG_HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.post(f"{base_url.rstrip('/')}/place_instance", json=payload)
+        response.raise_for_status()
+    asyncio.create_task(_poll_once(trigger_recovery=False))
+    return {"placed": True, "model_id": model_id, "min_nodes": min_nodes}
+
+
+@app.delete("/instance/{instance_id}")
+async def instance_delete(instance_id: str):
+    """Delete a specific instance from the exo cluster."""
+    base_url = _state.api_endpoint
+    if not base_url:
+        if not _switch_to_healthy_endpoint():
+            raise HTTPException(status_code=503, detail="No healthy exo endpoint available")
+        base_url = _state.api_endpoint
+    async with httpx.AsyncClient(timeout=WATCHDOG_HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.delete(f"{base_url.rstrip('/')}/instance/{instance_id}")
+        response.raise_for_status()
+    asyncio.create_task(_poll_once(trigger_recovery=False))
+    return {"deleted": True, "instance_id": instance_id}
 
 
 @app.post("/poll")
