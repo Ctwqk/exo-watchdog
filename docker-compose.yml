@@ -3,8 +3,6 @@ services:
     build: .
     container_name: exo-watchdog
     restart: unless-stopped
-    ports:
-      - "8765:8000"
     environment:
       EXO_ENDPOINTS: "http://192.168.20.1:52415,http://192.168.20.2:52415,http://192.168.20.3:52415"
       EXO_CONTROL_ENDPOINT: "http://192.168.20.1:52415"
